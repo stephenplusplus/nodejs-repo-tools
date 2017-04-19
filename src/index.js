@@ -22,9 +22,173 @@ const proxyquire = require('proxyquire').noPreserveCache();
 const sinon = require(`sinon`);
 const supertest = require('supertest');
 
-const { install, app, deploy } = require('./api/testRunner');
-const { onChange } = require('./webhook');
-const utils = require('./api/utils');
+const install = require('./api/testRunner/install');
+const onChange = require('./webhook/onChange');
+
+const MAX_TRIES = 8;
+const PROJECT_ID = process.env.GCLOUD_PROJECT;
+
+function finalize (err, resolve, reject, done) {
+  if (err) {
+    reject(err);
+    if (typeof done === 'function') {
+      done(err);
+    }
+  } else {
+    resolve();
+    if (typeof done === 'function') {
+      done();
+    }
+  }
+}
+
+function log (config, msg) {
+  console.log(`${config.test.bold}: ${msg}`);
+}
+
+// Send a request to the given url and test that the response body has the
+// expected value
+function testRequest (url, config, numTry) {
+  log(config, `VERIFYING: ${url}`);
+  if (!numTry) {
+    numTry = 1;
+  }
+
+  return got(url)
+    .then((response) => {
+      const EXPECTED_STATUS_CODE = config.code || 200;
+
+      const body = response.body || '';
+      const code = response.statusCode;
+
+      if (code !== EXPECTED_STATUS_CODE) {
+        throw new Error(`${config.test}: failed verification!\nExpected status code: ${EXPECTED_STATUS_CODE}\nActual: ${code}`);
+      } else if (!body.includes(config.msg)) {
+        throw new Error(`${config.test}: failed verification!\nExpected body: ${config.msg}\nActual: ${body}`);
+      } else if (config.testStr && !config.testStr.test(body)) {
+        throw new Error(`${config.test}: failed verification!\nExpected body: ${config.testStr}\nActual: ${body}`);
+      }
+    }, (err) => {
+      if (err && err.response) {
+        const EXPECTED_STATUS_CODE = config.code || 200;
+
+        const body = err.response.body || '';
+        const code = err.response.statusCode;
+
+        if (code !== EXPECTED_STATUS_CODE) {
+          throw new Error(`${config.test}: failed verification!\nExpected status code: ${EXPECTED_STATUS_CODE}\nActual: ${code}`);
+        } else if (!body.includes(config.msg)) {
+          throw new Error(`${config.test}: failed verification!\nExpected body: ${config.msg}\nActual: ${body}`);
+        } else if (config.testStr && !config.testStr.test(body)) {
+          throw new Error(`${config.test}: failed verification!\nExpected body: ${config.testStr}\nActual: ${body}`);
+        }
+      } else {
+        return Promise.reject(err);
+      }
+    })
+    .catch((err) => {
+      if (numTry >= MAX_TRIES) {
+        return Promise.reject(err);
+      }
+
+      return new Promise((resolve, reject) => {
+        setTimeout(() => {
+          testRequest(url, config, numTry + 1).then(resolve, reject);
+        }, 500 * Math.pow(numTry, 2));
+      });
+    });
+}
+
+function getUrl (config) {
+  return `https://${config.test}-dot-${PROJECT_ID}.appspot-preview.com`;
+}
+
+let portrange = 45032;
+const triedPorts = {};
+
+function getPort (config) {
+  let port = config.port || portrange;
+
+  triedPorts[port] = true;
+
+  while (triedPorts[port]) {
+    port += 1;
+  }
+
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.listen(port, () => {
+      server.once('close', () => {
+        resolve(port);
+      });
+      server.close();
+    });
+    server.on('error', () => {
+      resolve(getPort(config));
+    });
+  });
+}
+
+// Delete an App Engine version
+exports.deleteVersion = (config, done) => {
+  return new Promise((resolve, reject) => {
+    log(config, 'DELETING DEPLOYMENT...');
+    // Keep track off whether "done" has been called yet
+    let calledDone = false;
+
+    const args = [
+      `app`,
+      `versions`,
+      `delete`,
+      config.test,
+      `--project=${PROJECT_ID}`,
+      `-q`
+    ];
+
+    const child = childProcess.spawn(`gcloud`, args, {
+      cwd: config.cwd,
+      // Shouldn't take more than 4 minutes to delete a deployed version
+      timeout: 4 * 60 * 1000
+    });
+
+    log(config, `gcloud ${args.join(' ')}`);
+
+    child.on('error', finish);
+
+    child.stdout.on('data', (data) => {
+      const str = data.toString();
+      if (str.includes('\n')) {
+        process.stdout.write(`${config.test.bold}: ${str}`);
+      } else {
+        process.stdout.write(str);
+      }
+    });
+    child.stderr.on('data', (data) => {
+      const str = data.toString();
+      if (str.includes('\n')) {
+        process.stderr.write(`${config.test.bold}: ${str}`);
+      } else {
+        process.stderr.write(str);
+      }
+    });
+
+    child.on('exit', (code) => {
+      if (code !== 0) {
+        finish(new Error(`${config.test}: failed to delete deployment!`));
+      } else {
+        finish();
+      }
+    });
+
+    // Exit helper so we don't call "cb" more than once
+    function finish (err) {
+      if (!calledDone) {
+        calledDone = true;
+        finalize(err, resolve, reject, done);
+      }
+    }
+  });
+};
 
 exports.getRequest = (config) => {
   if (process.env.E2E_TESTS) {
