@@ -23,7 +23,7 @@ const sinon = require(`sinon`);
 const supertest = require('supertest');
 
 const install = require('./api/testRunner/install');
-const onChange = require('./webhook/onChange');
+const onChange = require('./webhook').onChange;
 
 const MAX_TRIES = 8;
 const PROJECT_ID = process.env.GCLOUD_PROJECT;
