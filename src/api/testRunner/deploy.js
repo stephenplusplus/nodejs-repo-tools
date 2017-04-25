@@ -49,6 +49,7 @@ module.exports = (config = {}) => {
   return new Promise((resolve, reject) => {
     config.now = Date.now();
     config.cwd = config.cwd || process.cwd();
+    config.tries = config.tries || 3;
     const cmd = config.deployCmd || 'gcloud';
 
     if (config.dryRun) {
@@ -84,15 +85,6 @@ module.exports = (config = {}) => {
       return;
     }
 
-    const logFile = path.join(config.cwd, `${config.test}-${config.now}.log`);
-    const logStream = fs.createWriteStream(logFile, { flags: 'a' });
-
-    // Don't use "npm run deploy" because we need extra flags
-    const proc = spawn(cmd, args, {
-      cwd: config.cwd,
-      shell: true
-    });
-
     // Exit helper so we don't call "done" more than once
     function finish (err) {
       try {
@@ -120,8 +112,6 @@ module.exports = (config = {}) => {
       }
     }
 
-    let numEnded = 0;
-
     function finishLogs () {
       numEnded++;
       if (numEnded === 2) {
@@ -130,92 +120,129 @@ module.exports = (config = {}) => {
       }
     }
 
-    try {
-      logStream.on('finish', () => {
-        if (!logFinished) {
-          logFinished = true;
+    function attemptDeploy (triesLeft) {
+      console.log(`${triesLeft.red} tries remaining...`);
+      log(config, 'DEPLOYING... ');
+
+      const logFile = path.join(config.cwd, `${config.test}-${Date.now()}.log`);
+      const logStream = fs.createWriteStream(logFile, { flags: 'a' });
+
+      let numEnded = 0;
+      function finishLogs () {
+        numEnded++;
+        if (numEnded === 2) {
+          logStream.end();
+          log(config, `Saved logfile to ${logFile}`);
         }
-      });
-
-      proc.stdout.pipe(logStream, { end: false });
-      proc.stderr.pipe(logStream, { end: false });
-
-      proc.stdout.on('data', (data) => {
-        const str = data.toString();
-        if (str.includes('\n')) {
-          process.stdout.write(`${config.test.bold}: ${'stdout:'.bold} ${str}`);
-        } else {
-          process.stdout.write(str);
-        }
-      });
-      proc.stderr.on('data', (data) => {
-        const str = data.toString();
-        if (str.includes('\n')) {
-          process.stderr.write(`${config.test.bold}: ${'stderr:'.bold} ${str}`);
-        } else {
-          process.stderr.write(str);
-        }
-      });
-
-      proc.stdout.on('end', finishLogs);
-      proc.stderr.on('end', finishLogs);
-
-      // This is called if the process fails to start. "error" event may or may
-      // not be fired in addition to the "exit" event.
-      proc.on('error', finish);
-
-      // Process has completed
-      proc.on('exit', (code, signal) => {
-        if (signal === 'SIGKILL') {
-          log(config, 'SIGKILL received!');
-        }
-        if (code !== 0 && signal !== 'SIGKILL') {
-          // Deployment failed
-          log(config, `ERROR ${code} ${signal}`);
-
-          // Pass error as second argument so we don't short-circuit the
-          // parallel tasks
-          finish(new Error(`${config.test}: failed to deploy!`));
-        } else {
-          // Deployment succeeded
-          log(config, 'App deployed...');
-
-          // Give apps time to start
-          setTimeout(() => {
-            // Test versioned url of "default" module
-            let demoUrl = getUrl(config);
-
-            if (config.demoUrl) {
-              demoUrl = config.demoUrl;
-            }
-
-            // Test that app is running successfully
-            log(config, `Testing ${demoUrl}`);
-            testRequest(demoUrl, config)
-              .then(() => {
-                log(config, 'Success!');
-                finish();
-              }, finish);
-          }, 5000);
-        }
-      });
-    } catch (err) {
-      if (proc) {
-        proc.kill('SIGKILL');
       }
-      finish(err);
+
+      // Don't use "npm run deploy" because we need extra flags
+      const proc = childProcess.spawn('gcloud', args, {
+        cwd: config.cwd,
+        shell: true
+      });
+
+      log(config, `gcloud ${args.join(' ')}`);
+
+      try {
+        logStream.on('finish', () => {
+          if (!logFinished) {
+            logFinished = true;
+          }
+        });
+
+        proc.stdout.pipe(logStream, { end: false });
+        proc.stderr.pipe(logStream, { end: false });
+
+        proc.stdout.on('data', (data) => {
+          const str = data.toString();
+          if (str.includes('\n')) {
+            process.stdout.write(`${config.test.bold}: ${'stdout:'.bold} ${str}`);
+          } else {
+            process.stdout.write(str);
+          }
+        });
+        proc.stderr.on('data', (data) => {
+          const str = data.toString();
+          if (str.includes('\n')) {
+            process.stderr.write(`${config.test.bold}: ${'stderr:'.bold} ${str}`);
+          } else {
+            process.stderr.write(str);
+          }
+        });
+
+        proc.stdout.on('end', finishLogs);
+        proc.stderr.on('end', finishLogs);
+
+        // This is called if the process fails to start. "error" event may or may
+        // not be fired in addition to the "exit" event.
+        proc.on('error', finish);
+
+        // Process has completed
+        proc.on('exit', (code, signal) => {
+          if (signal === 'SIGKILL') {
+            log(config, 'SIGKILL received!');
+          }
+          if (code !== 0 && signal !== 'SIGKILL') {
+            // Deployment failed
+            log(config, `ERROR ${code} ${signal}`);
+
+            // Pass error as second argument so we don't short-circuit the
+            // parallel tasks
+            const error = new Error(`${config.test}: failed to deploy!`);
+            if (triesLeft > 0) {
+              console.error(error);
+              attemptDeploy(triesLeft - 1);
+            } else {
+              finish(error);
+            }
+          } else {
+            // Deployment succeeded
+            log(config, 'App deployed...');
+
+            // Give apps time to start
+            setTimeout(() => {
+              // Test versioned url of "default" module
+              let demoUrl = getUrl(config);
+
+              if (config.demoUrl) {
+                demoUrl = config.demoUrl;
+              }
+
+              // Test that app is running successfully
+              log(config, `Testing ${demoUrl}`);
+              testRequest(demoUrl, config, (err) => {
+                if (err && triesLeft > 0) {
+                  console.error(err);
+                  attemptDeploy(triesLeft - 1);
+                } else {
+                  log(config, 'Success!');
+                  finish(err);
+                }
+              });
+            }, 5000);
+          }
+        });
+      } catch (err) {
+        if (proc) {
+          proc.kill('SIGKILL');
+        }
+        finish(err);
+      }
+      .then(() => {
+        if (config.delete && !config.dryRun) {
+          return deleteVersion(config).catch(() => {});
+        }
+      }, (err) => {
+        if (config.delete && !config.dryRun) {
+          return deleteVersion(config)
+            .catch(() => {})
+            .then(() => Promise.reject(err));
+        }
+        return Promise.reject(err);
+      });
     }
-  })
-  .then(() => {
-    if (config.delete && !config.dryRun) {
-      return deleteVersion(config).catch(() => {});
-    }
-  }, (err) => {
-    if (config.delete && !config.dryRun) {
-      return deleteVersion(config)
-        .catch(() => {})
-        .then(() => Promise.reject(err));
-    }
-    return Promise.reject(err);
+
+    attemptDeploy(config.tries);
   });
 };
